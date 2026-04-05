@@ -1,0 +1,45 @@
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  sample_rate: 22050          # Target sample rate for all audio clips
+  clip_duration: 5.0          # Seconds per audio segment
+  overlap: 0.0                # Overlap between consecutive clips (fraction)
+  classes: ["normal", "crackle", "wheeze", "both"]
+
+cochleogram:
+  n_filters: 128              # Number of cochlear filters (frequency channels)
+  low_lim: 50                 # Lower frequency limit (Hz)
+  high_lim: 8000              # Upper frequency limit (Hz)
+  sample_factor: 1            # Samples per ERB filter (1 = minimal)
+  padding: "SAME"
+  downsample: null            # If not null, temporal downsampling factor
+
+model:
+  image_size: 128             # Cochleogram will be resized to image_size x image_size
+  patch_size: 16              # ViT patch size
+  num_classes: 4              # normal / crackle / wheeze / both
+  dim: 512                    # Embedding dimension
+  depth: 6                    # Transformer depth (number of encoder blocks)
+  heads: 8                    # Number of attention heads
+  mlp_dim: 1024               # Feed-forward hidden dimension
+  dropout: 0.1
+  emb_dropout: 0.1
+  channels: 1                 # Grayscale cochleograms
+
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 3e-4
+  weight_decay: 1e-4
+  scheduler: "cosine"         # "cosine" | "step" | null
+  warmup_epochs: 5
+  seed: 42
+  val_split: 0.1              # Fraction of training set used for validation
+  num_workers: 4
+  device: "cuda"              # "cuda" | "cpu" | "mps"
+
+logging:
+  log_dir: "runs/"
+  save_dir: "checkpoints/"
+  save_every: 5               # Save checkpoint every N epochs
+  log_every: 10               # Log metrics every N batches

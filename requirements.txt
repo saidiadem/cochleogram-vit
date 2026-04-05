@@ -1,0 +1,42 @@
+# Core ML
+torch>=2.1.0
+torchaudio>=2.1.0
+torchvision>=0.16.0
+
+# Vision Transformer
+vit-pytorch>=1.7.0
+
+# Audio / Signal Processing
+librosa>=0.10.0
+soundfile>=0.12.1
+resampy>=0.4.2
+
+# Cochleagram generation
+# Install manually from source:
+#   pip install git+https://github.com/mcdermottLab/pycochleagram.git
+# pycochleagram is not on PyPI
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Data handling
+pandas>=2.0.0
+h5py>=3.9.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Config & utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+einops>=0.7.0
+
+# Experiment tracking (optional but recommended)
+tensorboard>=2.14.0
+
+# Notebook
+jupyter>=1.0.0
+ipykernel>=6.25.0
