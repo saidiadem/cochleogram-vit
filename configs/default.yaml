@@ -1,13 +1,13 @@
 data:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
-  sample_rate: 22050          # Target sample rate for all audio clips
-  clip_duration: 5.0          # Seconds per audio segment
+  sample_rate: 4000          # Target sample rate for all audio clips
+  clip_duration: 6.0          # Seconds per audio segment
   overlap: 0.0                # Overlap between consecutive clips (fraction)
   classes: ["normal", "crackle", "wheeze", "both"]
 
 cochleogram:
-  n_filters: 128              # Number of cochlear filters (frequency channels)
+  n_filters: 64              # Number of cochlear filters (frequency channels)
   low_lim: 50                 # Lower frequency limit (Hz)
   high_lim: 8000              # Upper frequency limit (Hz)
   sample_factor: 1            # Samples per ERB filter (1 = minimal)
@@ -15,6 +15,7 @@ cochleogram:
   downsample: null            # If not null, temporal downsampling factor
 
 model:
+  name: "BaselineCNN"         # Switch between "CochleogramViT" and "BaselineCNN"
   image_size: 128             # Cochleogram will be resized to image_size x image_size
   patch_size: 16              # ViT patch size
   num_classes: 4              # normal / crackle / wheeze / both

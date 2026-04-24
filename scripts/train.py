@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Subset
 
 from cochleogram_vit.data.dataset import ICBHIDataset, build_icbhi_dataframe
 from cochleogram_vit.models.vit import CochleogramViT
+from cochleogram_vit.models.baseline_cnn import BaselineCNN
 from cochleogram_vit.preprocessing.cochleogram import CochleogramTransform
 from cochleogram_vit.training.trainer import Trainer
 from cochleogram_vit.utils.config import get_device, load_config, seed_everything
@@ -101,7 +102,18 @@ def main():
     # ------------------------------------------------------------------ #
     # Model
     # ------------------------------------------------------------------ #
-    model = CochleogramViT.from_config(cfg)
+    model_name = cfg["model"].get("name", "CochleogramViT")
+    if model_name == "BaselineCNN":
+        print("[train] Initializing: BaselineCNN")
+        model = BaselineCNN(
+            in_channels=cfg["model"].get("channels", 1),
+            num_classes=cfg["model"]["num_classes"]
+        )
+    else:
+        print("[train] Initializing: CochleogramViT")
+        model = CochleogramViT.from_config(cfg)
+    
+    model = model.to(device)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
