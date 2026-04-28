@@ -8,8 +8,8 @@ data:
 
 cochleogram:
   n_filters: 64              # Number of cochlear filters (frequency channels)
-  low_lim: 50                 # Lower frequency limit (Hz)
-  high_lim: 8000              # Upper frequency limit (Hz)
+  low_lim: 100                # Lower frequency limit (Hz) — Mang et al. 2024
+  high_lim: 1999              # Upper frequency limit (Hz) — just under fs/2 (2000) for pycochleagram strict check
   sample_factor: 1            # Samples per ERB filter (1 = minimal)
   padding: "SAME"
   downsample: null            # If not null, temporal downsampling factor
