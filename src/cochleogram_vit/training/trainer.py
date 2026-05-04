@@ -58,6 +58,16 @@ class Trainer:
         self.save_dir = Path(cfg["logging"]["save_dir"])
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
+        # Early stopping configuration
+        # User-configurable via cfg["training"]["early_stopping"] = True/False
+        # patience: number of consecutive epochs without sufficient improvement
+        # rel_improve: required improvement threshold expressed as fraction (e.g. 0.25)
+        self.early_stop_enabled = t_cfg.get("early_stopping", False)
+        self.early_stop_patience = int(t_cfg.get("early_stopping_patience", 10))
+        self.early_stop_rel = float(t_cfg.get("early_stopping_rel", 0.25))
+        self._early_no_improve = 0
+        self._early_best_val_loss = float("inf")
+
         # Loss
         self.criterion = nn.CrossEntropyLoss()
 
@@ -121,6 +131,33 @@ class Trainer:
 
             if epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
+
+            # -------------------------
+            # Early stopping (optional)
+            # -------------------------
+            # Interpretation/assumption: we require the validation loss to decrease
+            # by at least `early_stop_rel * train_loss` compared to the previous
+            # best validation loss. If this does not happen for `patience`
+            # consecutive epochs, stop training early.
+            if self.early_stop_enabled:
+                cur_val_loss = val_metrics.get("loss", float("inf"))
+                cur_train_loss = train_metrics.get("loss", float("inf"))
+
+                # Amount of improvement (positive if val loss decreased)
+                improvement = self._early_best_val_loss - cur_val_loss
+                required = self.early_stop_rel * (cur_train_loss + 1e-8)
+
+                if improvement > required:
+                    # Sufficient improvement: reset counter and update best
+                    self._early_best_val_loss = min(self._early_best_val_loss, cur_val_loss)
+                    self._early_no_improve = 0
+                else:
+                    self._early_no_improve += 1
+                    print(f"  EarlyStopping: no sufficient val-loss improvement ({self._early_no_improve}/{self.early_stop_patience})")
+
+                if self._early_no_improve >= self.early_stop_patience:
+                    print(f"\nEarly stopping triggered. No sufficient validation loss improvement for {self.early_stop_patience} epochs.")
+                    break
 
         self.writer.close()
         print(f"\nTraining complete. Best ICBHI score: {self.best_icbhi_score:.4f} at epoch {self.best_epoch}.")
