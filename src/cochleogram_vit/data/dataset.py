@@ -1,15 +1,19 @@
 """
 ICBHI 2017 Challenge Dataset loader.
 
-Directory layout expected under `raw_dir`:
-    <raw_dir>/
-        *.wav          -- audio recordings
-        *.txt          -- annotation files (one per recording)
-        ICBHI_Challenge_diagnosis.txt  -- patient diagnosis metadata
+Two dataset classes are provided:
 
-Annotation file format (per respiratory cycle):
-    <start_sec> <end_sec> <crackles> <wheezes>
-    e.g.:  0.036  1.018  0  0
+1. CochleogramDataset — loads pre-generated RGB cochleograms from disk.
+   Use this after running scripts/precompute_rgb.py.
+   This is the recommended and faster option.
+
+2. ICBHIDataset — loads raw .wav files and applies a transform on the fly.
+   Use this if you want to generate cochleograms during training.
+
+Directory layout for CochleogramDataset:
+    data/processed/
+        cochleograms_rgb/    ← RGB .npy files (shape: 3 x H x W, float32)
+        metadata.csv         ← columns: npy_path, label
 
 Labels map:
     0 → normal   (crackles=0, wheezes=0)
@@ -34,6 +38,53 @@ LABEL_MAP = {(0, 0): 0, (1, 0): 1, (0, 1): 2, (1, 1): 3}
 CLASS_NAMES = ["normal", "crackle", "wheeze", "both"]
 
 
+# ------------------------------------------------------------------ #
+# CochleogramDataset — pre-generated RGB .npy files (used in training)
+# ------------------------------------------------------------------ #
+
+class CochleogramDataset(Dataset):
+    """
+    Loads pre-generated RGB cochleograms from .npy files.
+    Expects files to be already in (3, H, W) float32 format,
+    as produced by scripts/precompute_rgb.py.
+
+    Args:
+        data_dir:      Path to folder containing RGB .npy cochleogram files.
+        metadata_path: Path to metadata.csv with columns: npy_path, label.
+        transform:     Optional callable applied to the tensor after loading.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        metadata_path: str,
+        transform: Optional[Callable] = None,
+    ):
+        self.data_dir = data_dir
+        self.metadata = pd.read_csv(metadata_path)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.metadata)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        row = self.metadata.iloc[idx]
+        npy_path = os.path.join(self.data_dir, os.path.basename(row["npy_path"]))
+
+        # Already (3, H, W) float32 — no colormap conversion needed
+        rgb = np.load(npy_path)
+        tensor = torch.from_numpy(rgb)
+
+        if self.transform:
+            tensor = self.transform(tensor)
+
+        return tensor, int(row["label"])
+
+
+# ------------------------------------------------------------------ #
+# ICBHIDataset — raw .wav files with on-the-fly transform
+# ------------------------------------------------------------------ #
+
 def _parse_annotation_file(txt_path: Path) -> list[tuple[float, float, int, int]]:
     """Return a list of (start, end, crackle, wheeze) tuples from an annotation .txt."""
     cycles = []
@@ -42,7 +93,10 @@ def _parse_annotation_file(txt_path: Path) -> list[tuple[float, float, int, int]
             parts = line.strip().split()
             if len(parts) < 4:
                 continue
-            start, end, crackle, wheeze = float(parts[0]), float(parts[1]), int(parts[2]), int(parts[3])
+            start, end, crackle, wheeze = (
+                float(parts[0]), float(parts[1]),
+                int(parts[2]), int(parts[3]),
+            )
             cycles.append((start, end, crackle, wheeze))
     return cycles
 
@@ -50,7 +104,6 @@ def _parse_annotation_file(txt_path: Path) -> list[tuple[float, float, int, int]
 def build_icbhi_dataframe(raw_dir: str | Path) -> pd.DataFrame:
     """
     Scan `raw_dir` and build a DataFrame with one row per respiratory cycle.
-
     Columns: wav_path, start, end, label (int), label_name (str)
     """
     raw_dir = Path(raw_dir)
@@ -65,31 +118,27 @@ def build_icbhi_dataframe(raw_dir: str | Path) -> pd.DataFrame:
 
         for start, end, crackle, wheeze in _parse_annotation_file(txt_path):
             label = LABEL_MAP.get((crackle, wheeze), 0)
-            rows.append(
-                {
-                    "wav_path": str(wav_path),
-                    "start": start,
-                    "end": end,
-                    "label": label,
-                    "label_name": CLASS_NAMES[label],
-                }
-            )
+            rows.append({
+                "wav_path": str(wav_path),
+                "start": start,
+                "end": end,
+                "label": label,
+                "label_name": CLASS_NAMES[label],
+            })
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 class ICBHIDataset(Dataset):
     """
     PyTorch Dataset for ICBHI 2017 respiratory sound cycles.
+    Loads raw .wav files and applies a transform on the fly.
 
     Args:
-        dataframe:    DataFrame produced by `build_icbhi_dataframe`.
-        target_sr:    Target sample rate (audio is resampled if needed).
-        clip_duration: Fixed clip length in seconds. Shorter clips are zero-padded;
-                       longer clips are truncated.
-        transform:    Optional callable applied to the raw waveform tensor
-                      (e.g. cochleogram conversion). Should return a tensor.
+        dataframe:     DataFrame produced by `build_icbhi_dataframe`.
+        target_sr:     Target sample rate (audio is resampled if needed).
+        clip_duration: Fixed clip length in seconds.
+        transform:     Optional callable applied to the waveform tensor.
     """
 
     def __init__(
@@ -112,21 +161,18 @@ class ICBHIDataset(Dataset):
 
         waveform, sr = torchaudio.load(row["wav_path"])
 
-        # Convert to mono
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Resample if needed
         if sr != self.target_sr:
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sr, new_freq=self.target_sr
+            )
             waveform = resampler(waveform)
 
-        # Slice the respiratory cycle
         start_sample = int(row["start"] * self.target_sr)
-        end_sample = int(row["end"] * self.target_sr)
+        end_sample   = int(row["end"]   * self.target_sr)
         clip = waveform[:, start_sample:end_sample]
-
-        # Pad or truncate to fixed length
         clip = self._fix_length(clip)
 
         if self.transform is not None:
@@ -145,7 +191,6 @@ class ICBHIDataset(Dataset):
 
     @property
     def class_weights(self) -> torch.Tensor:
-        """Inverse-frequency weights for use with WeightedRandomSampler or CrossEntropyLoss."""
         counts = self.df["label"].value_counts().sort_index()
         weights = 1.0 / counts.values.astype(float)
         weights = weights / weights.sum()

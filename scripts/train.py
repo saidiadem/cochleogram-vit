@@ -1,30 +1,23 @@
+# scripts/train.py
 """
-scripts/train.py
-----------------
 End-to-end training entry point.
 
 Usage:
     python scripts/train.py --config configs/default.yaml
-
-The script:
-  1. Loads config and sets seeds.
-  2. Builds ICBHIDataset with CochleogramTransform (on-the-fly generation)
-     OR loads pre-generated cochleograms from data/processed/ (faster).
-  3. Splits into train/val using a fixed seed.
-  4. Instantiates CochleogramViT from config.
-  5. Runs training via Trainer.
 """
 
 import argparse
+import os
 
+import numpy as np
 import torch
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import GroupKFold
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, WeightedRandomSampler, SubsetRandomSampler
 
-from cochleogram_vit.data.dataset import ICBHIDataset, build_icbhi_dataframe
+from cochleogram_vit.data.dataset import CochleogramDataset
 from cochleogram_vit.models.vit import CochleogramViT
 from cochleogram_vit.models.baseline_cnn import BaselineCNN
-from cochleogram_vit.preprocessing.cochleogram import CochleogramTransform
 from cochleogram_vit.training.trainer import Trainer
 from cochleogram_vit.utils.config import get_device, load_config, seed_everything
 
@@ -32,7 +25,6 @@ from cochleogram_vit.utils.config import get_device, load_config, seed_everythin
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CochleogramViT on ICBHI 2017.")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--resume", default=None, help="Path to checkpoint .pt to resume from.")
     return parser.parse_args()
 
 
@@ -47,90 +39,139 @@ def main():
     # ------------------------------------------------------------------ #
     # Dataset
     # ------------------------------------------------------------------ #
-    raw_dir = cfg["data"]["raw_dir"]
-    print(f"[train] Building dataset from: {raw_dir}")
-    df = build_icbhi_dataframe(raw_dir)
-    print(f"[train] Total cycles: {len(df)}")
-
-    transform = CochleogramTransform(
-        sr=cfg["data"]["sample_rate"],
-        n_filters=cfg["cochleogram"]["n_filters"],
-        low_lim=cfg["cochleogram"]["low_lim"],
-        high_lim=cfg["cochleogram"]["high_lim"],
-        sample_factor=cfg["cochleogram"]["sample_factor"],
-        downsample=cfg["cochleogram"].get("downsample"),
-        output_size=cfg["model"]["image_size"],
+    dataset = CochleogramDataset(
+        data_dir=cfg["data"]["processed_dir"],
+        metadata_path=cfg["data"]["metadata_path"],
     )
-
-    dataset = ICBHIDataset(
-        dataframe=df,
-        target_sr=cfg["data"]["sample_rate"],
-        clip_duration=cfg["data"]["clip_duration"],
-        transform=transform,
-    )
-
-    # Train / val split (stratified)
-    indices = list(range(len(dataset)))
-    labels = df["label"].tolist()
-    val_frac = cfg["training"]["val_split"]
-    train_idx, val_idx = train_test_split(
-        indices,
-        test_size=val_frac,
-        stratify=labels,
-        random_state=cfg["training"]["seed"],
-    )
-
-    train_set = Subset(dataset, train_idx)
-    val_set = Subset(dataset, val_idx)
-    print(f"[train] Train: {len(train_set)}  Val: {len(val_set)}")
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=True,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["training"]["num_workers"],
-        pin_memory=(device.type == "cuda"),
-    )
+    print(f"[train] Total samples: {len(dataset)}")
 
     # ------------------------------------------------------------------ #
-    # Model
+    # Class weights (softened ^0.75, renormalized)
     # ------------------------------------------------------------------ #
-    model_name = cfg["model"].get("name", "CochleogramViT")
-    if model_name == "BaselineCNN":
-        print("[train] Initializing: BaselineCNN")
-        model = BaselineCNN(
-            in_channels=cfg["model"].get("channels", 1),
-            num_classes=cfg["model"]["num_classes"]
+    labels = dataset.metadata["label"].values
+    raw_weights = compute_class_weight(
+        "balanced",
+        classes=np.array([0, 1, 2, 3]),
+        y=labels,
+    )
+    class_weights = raw_weights ** 0.75
+    class_weights = class_weights / class_weights.sum() * len(class_weights)
+    print(f"[train] Class weights (softened ^0.75, renormalized):")
+    for i, name in enumerate(["Normal", "Crackles", "Wheezes", "Both"]):
+        print(f"         {name:<10}: {class_weights[i]:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # GroupKFold by patient ID
+    # ------------------------------------------------------------------ #
+    metadata = dataset.metadata.copy()
+    metadata["patient_id"] = metadata["npy_path"].apply(
+        lambda x: os.path.basename(x).split("_")[0]
+    )
+    groups = metadata["patient_id"].values
+    n_splits = cfg["training"]["n_splits"]
+    gkf = GroupKFold(n_splits=n_splits)
+
+    fold_results = []
+    all_preds_total = []
+    all_labels_total = []
+
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(metadata, groups=groups)):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold+1}/{n_splits}")
+        print(f"{'='*60}")
+
+        # Per-fold seed
+        seed_everything(cfg["training"]["seed"] + fold)
+
+        # WeightedRandomSampler for training
+        train_labels = metadata["label"].values[train_idx]
+        sample_weights = torch.tensor(
+            [class_weights[l] for l in train_labels],
+            dtype=torch.float,
         )
-    else:
-        print("[train] Initializing: CochleogramViT")
-        model = CochleogramViT.from_config(cfg)
-    
-    model = model.to(device)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"[train] Resumed from: {args.resume} (epoch {checkpoint['epoch']})")
+        # SubsetRandomSampler for validation (real distribution, no balancing)
+        val_sampler = SubsetRandomSampler(val_idx)
+
+        train_loader = DataLoader(
+            dataset,
+            batch_size=cfg["training"]["batch_size"],
+            sampler=train_sampler,
+            num_workers=cfg["training"]["num_workers"],
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = DataLoader(
+            dataset,
+            batch_size=cfg["training"]["batch_size"],
+            sampler=val_sampler,
+            num_workers=cfg["training"]["num_workers"],
+            pin_memory=(device.type == "cuda"),
+        )
+
+        print(f"  Train samples: {len(train_idx)} | Val samples: {len(val_idx)}")
+
+        # ------------------------------------------------------------------ #
+        # Model — re-initialized every fold
+        # ------------------------------------------------------------------ #
+        model_name = cfg["model"].get("name", "CochleogramViT")
+        if model_name == "BaselineCNN":
+            model = BaselineCNN(
+                in_channels=cfg["model"].get("channels", 3),
+                num_classes=cfg["model"]["num_classes"],
+            )
+        else:
+            model = CochleogramViT.from_config(cfg)
+        model = model.to(device)
+
+        # ------------------------------------------------------------------ #
+        # Trainer
+        # ------------------------------------------------------------------ #
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            cfg=cfg,
+            device=device,
+            class_weights=class_weights,
+            fold=fold + 1,
+        )
+        fold_result = trainer.fit()
+
+        fold_results.append(fold_result)
+        all_preds_total.extend(fold_result["preds"])
+        all_labels_total.extend(fold_result["labels"])
 
     # ------------------------------------------------------------------ #
-    # Training
+    # Aggregated results across all folds
     # ------------------------------------------------------------------ #
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        cfg=cfg,
-        device=device,
+    from cochleogram_vit.training.metrics import compute_metrics
+
+    print(f"\n{'='*60}")
+    print("AGGREGATED 10-FOLD RESULTS")
+    print(f"{'='*60}")
+
+    agg = compute_metrics(
+        np.array(all_labels_total),
+        np.array(all_preds_total),
     )
-    trainer.fit()
+    print(f"  Accuracy:    {agg['accuracy']*100:.2f}%")
+    print(f"  Sensitivity: {agg['sensitivity']*100:.2f}%")
+    print(f"  Specificity: {agg['specificity']*100:.2f}%")
+    print(f"  Precision:   {agg['precision']*100:.2f}%")
+    print(f"  Score:       {agg['score']*100:.2f}%")
+    print(f"  TP={agg['TP']}  FN={agg['FN']}  TN={agg['TN']}  FP={agg['FP']}  FN_wrong_type={agg['FN_wrong_type']}")
+
+    # Macro average (mean ± std across folds)
+    scores = [f["score"] for f in fold_results]
+    print(f"\n  Macro Score: {np.mean(scores)*100:.2f}% ± {np.std(scores)*100:.2f}%")
+    print(f"\n{'='*60}")
+    print("Training complete.")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

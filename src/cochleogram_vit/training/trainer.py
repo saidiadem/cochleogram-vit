@@ -1,42 +1,27 @@
+# src/cochleogram_vit/training/trainer.py
 """
 Training and evaluation loop for CochleogramViT.
-
-Design decisions:
-  - No heavy framework dependency (no Lightning) — keeps the code transparent.
-  - TensorBoard logging via SummaryWriter.
-  - Cosine annealing LR schedule with optional linear warmup.
-  - Checkpoints saved as {save_dir}/epoch_{N:03d}.pt with best model tracking.
+One Trainer instance per fold.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
+import copy
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from cochleogram_vit.training.metrics import MetricTracker
+from cochleogram_vit.training.metrics import compute_metrics
 
 
 class Trainer:
-    """
-    Manages the full training lifecycle.
-
-    Args:
-        model:         CochleogramViT (or any nn.Module with matching I/O).
-        train_loader:  DataLoader for the training split.
-        val_loader:    DataLoader for the validation split.
-        cfg:           Full config dict (see configs/default.yaml).
-        device:        torch.device to train on.
-    """
-
     def __init__(
         self,
         model: nn.Module,
@@ -44,174 +29,177 @@ class Trainer:
         val_loader: DataLoader,
         cfg: dict,
         device: torch.device,
+        class_weights: np.ndarray,
+        fold: int,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = cfg
         self.device = device
+        self.fold = fold
 
         t_cfg = cfg["training"]
         self.epochs = t_cfg["epochs"]
-        self.log_every = cfg["logging"]["log_every"]
-        self.save_every = cfg["logging"]["save_every"]
         self.save_dir = Path(cfg["logging"]["save_dir"])
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Early stopping configuration
-        # User-configurable via cfg["training"]["early_stopping"] = True/False
-        # patience: number of consecutive epochs without sufficient improvement
-        # rel_improve: required improvement threshold expressed as fraction (e.g. 0.25)
-        self.early_stop_enabled = t_cfg.get("early_stopping", False)
-        self.early_stop_patience = int(t_cfg.get("early_stopping_patience", 10))
-        self.early_stop_rel = float(t_cfg.get("early_stopping_rel", 0.25))
-        self._early_no_improve = 0
-        self._early_best_val_loss = float("inf")
-
-        # Loss
-        self.criterion = nn.CrossEntropyLoss()
+        # Loss with softened class weights
+        weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
+        self.criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
         # Optimizer
-        self.optimizer = AdamW(
+        self.optimizer = Adam(
             self.model.parameters(),
             lr=t_cfg["learning_rate"],
             weight_decay=t_cfg["weight_decay"],
         )
 
-        # LR schedule: linear warmup → cosine annealing
-        warmup_epochs = t_cfg.get("warmup_epochs", 0)
-        cosine = CosineAnnealingLR(self.optimizer, T_max=self.epochs - warmup_epochs, eta_min=1e-6)
-        if warmup_epochs > 0:
-            warmup = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-            self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
-        else:
-            self.scheduler = cosine
+        # LR schedule: linear warmup → cosine decay
+        warmup_epochs = t_cfg.get("warmup_epochs", 4)
+        epochs = self.epochs
 
-        # TensorBoard
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            denom = epochs - warmup_epochs
+            if denom == 0:
+                return 0.0
+            return 0.5 * (1 + np.cos(np.pi * (epoch - warmup_epochs) / denom))
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        # TensorBoard — one run per fold
         log_dir = cfg["logging"]["log_dir"]
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = SummaryWriter(log_dir=f"{log_dir}/fold_{fold}")
 
-        self.best_icbhi_score = 0.0
-        self.best_epoch = 0
+        self.best_score = 0.0
+        self.best_model_state = None
+        self.best_epoch = 1
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def fit(self) -> dict:
+        for epoch in range(self.epochs):
+            # Training phase
+            self.model.train()
+            running_loss = 0.0
+            for cochleograms, labels in tqdm(
+                self.train_loader,
+                desc=f"  Fold {self.fold} Epoch {epoch+1}/{self.epochs}",
+                leave=False,
+            ):
+                cochleograms = cochleograms.to(self.device)
+                labels = labels.to(self.device)
 
-    def fit(self) -> None:
-        """Run the full training loop."""
-        for epoch in range(1, self.epochs + 1):
-            print(f"\n{'='*60}")
-            print(f"Epoch {epoch}/{self.epochs}  |  LR: {self._current_lr():.2e}")
+                self.optimizer.zero_grad()
+                outputs = self.model(cochleograms)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                running_loss += loss.item()
 
-            train_metrics = self._run_epoch(epoch, training=True)
-            val_metrics = self._run_epoch(epoch, training=False)
+            train_loss = running_loss / len(self.train_loader)
 
+            # Validation phase
+            val_loss, val_preds, val_labels = self._evaluate()
+            metrics = compute_metrics(
+                np.array(val_labels),
+                np.array(val_preds),
+            )
+            epoch_score = metrics["score"]
+
+            # Track best checkpoint
+            if epoch_score > self.best_score:
+                self.best_score = epoch_score
+                self.best_model_state = copy.deepcopy(self.model.state_dict())
+                self.best_epoch = epoch + 1
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
             self.scheduler.step()
 
-            self._log_metrics(epoch, train_metrics, split="train")
-            self._log_metrics(epoch, val_metrics, split="val")
+            # TensorBoard
+            self.writer.add_scalar("train/loss", train_loss, epoch)
+            self.writer.add_scalar("val/loss", val_loss, epoch)
+            self.writer.add_scalar("val/score", epoch_score, epoch)
+            self.writer.add_scalar("val/sensitivity", metrics["sensitivity"], epoch)
+            self.writer.add_scalar("val/specificity", metrics["specificity"], epoch)
+            self.writer.add_scalar("lr", current_lr, epoch)
 
             print(
-                f"  Train → loss: {train_metrics['loss']:.4f}  "
-                f"acc: {train_metrics['accuracy']:.3f}  "
-                f"ICBHI: {train_metrics['icbhi_score']:.3f}"
-            )
-            print(
-                f"  Val   → loss: {val_metrics['loss']:.4f}  "
-                f"acc: {val_metrics['accuracy']:.3f}  "
-                f"ICBHI: {val_metrics['icbhi_score']:.3f}"
+                f"  Epoch {epoch+1:>2}/{self.epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Score: {epoch_score*100:.2f}% | "
+                f"LR: {current_lr:.6f}"
             )
 
-            if val_metrics["icbhi_score"] > self.best_icbhi_score:
-                self.best_icbhi_score = val_metrics["icbhi_score"]
-                self.best_epoch = epoch
-                self._save_checkpoint(epoch, tag="best")
-                print(f"  ** New best ICBHI score: {self.best_icbhi_score:.4f} (epoch {epoch})")
+        print(f"\n  Best checkpoint at epoch {self.best_epoch} "
+              f"with Score: {self.best_score*100:.2f}%")
 
-            if epoch % self.save_every == 0:
-                self._save_checkpoint(epoch)
+        # Load best model and run final evaluation
+        self.model.load_state_dict(self.best_model_state)
+        _, all_preds, all_labels = self._evaluate()
+        final_metrics = compute_metrics(
+            np.array(all_labels),
+            np.array(all_preds),
+        )
 
-            # -------------------------
-            # Early stopping (optional)
-            # -------------------------
-            # Interpretation/assumption: we require the validation loss to decrease
-            # by at least `early_stop_rel * train_loss` compared to the previous
-            # best validation loss. If this does not happen for `patience`
-            # consecutive epochs, stop training early.
-            if self.early_stop_enabled:
-                cur_val_loss = val_metrics.get("loss", float("inf"))
-                cur_train_loss = train_metrics.get("loss", float("inf"))
+        # Save best model for this fold to disk
+        self._save_checkpoint()
 
-                # Amount of improvement (positive if val loss decreased)
-                improvement = self._early_best_val_loss - cur_val_loss
-                required = self.early_stop_rel * (cur_train_loss + 1e-8)
-
-                if improvement > required:
-                    # Sufficient improvement: reset counter and update best
-                    self._early_best_val_loss = min(self._early_best_val_loss, cur_val_loss)
-                    self._early_no_improve = 0
-                else:
-                    self._early_no_improve += 1
-                    print(f"  EarlyStopping: no sufficient val-loss improvement ({self._early_no_improve}/{self.early_stop_patience})")
-
-                if self._early_no_improve >= self.early_stop_patience:
-                    print(f"\nEarly stopping triggered. No sufficient validation loss improvement for {self.early_stop_patience} epochs.")
-                    break
+        print(f"\n  --- Fold {self.fold} Results ---")
+        print(f"  Accuracy:    {final_metrics['accuracy']*100:.2f}%")
+        print(f"  Sensitivity: {final_metrics['sensitivity']*100:.2f}%")
+        print(f"  Specificity: {final_metrics['specificity']*100:.2f}%")
+        print(f"  Precision:   {final_metrics['precision']*100:.2f}%")
+        print(f"  Score:       {final_metrics['score']*100:.2f}%")
+        print(
+            f"  TP={final_metrics['TP']}  FN={final_metrics['FN']}  "
+            f"TN={final_metrics['TN']}  FP={final_metrics['FP']}  "
+            f"FN_wrong_type={final_metrics['FN_wrong_type']}"
+        )
 
         self.writer.close()
-        print(f"\nTraining complete. Best ICBHI score: {self.best_icbhi_score:.4f} at epoch {self.best_epoch}.")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        return {
+            **final_metrics,
+            "fold": self.fold,
+            "best_epoch": self.best_epoch,
+            "preds": all_preds,
+            "labels": all_labels,
+        }
 
-    def _run_epoch(self, epoch: int, training: bool) -> dict[str, float]:
-        self.model.train(training)
-        loader = self.train_loader if training else self.val_loader
-        tracker = MetricTracker()
-        global_step = (epoch - 1) * len(self.train_loader)
+    def _evaluate(self) -> tuple[float, list, list]:
+        self.model.eval()
+        val_loss = 0.0
+        all_preds = []
+        all_labels = []
 
-        with torch.set_grad_enabled(training):
-            for batch_idx, (inputs, targets) in enumerate(tqdm(loader, leave=False)):
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+        with torch.no_grad():
+            for cochleograms, labels in self.val_loader:
+                cochleograms = cochleograms.to(self.device)
+                labels = labels.to(self.device)
+                outputs = self.model(cochleograms)
+                loss = self.criterion(outputs, labels)
+                val_loss += loss.item()
+                preds = outputs.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
 
-                logits = self.model(inputs)
-                loss = self.criterion(logits, targets)
+        val_loss /= len(self.val_loader)
+        return val_loss, all_preds, all_labels
 
-                if training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-
-                    if (batch_idx + 1) % self.log_every == 0:
-                        step = global_step + batch_idx
-                        self.writer.add_scalar("train/batch_loss", loss.item(), step)
-
-                tracker.update(logits.detach(), targets.detach(), loss.item())
-
-        return tracker.compute()
-
-    def _log_metrics(self, epoch: int, metrics: dict[str, float], split: str) -> None:
-        for key, value in metrics.items():
-            self.writer.add_scalar(f"{split}/{key}", value, epoch)
-
-    def _save_checkpoint(self, epoch: int, tag: Optional[str] = None) -> None:
-        name = f"epoch_{epoch:03d}" if tag is None else f"{tag}"
-        path = self.save_dir / f"{name}.pt"
+    def _save_checkpoint(self) -> None:
+        path = self.save_dir / f"best_fold{self.fold}.pt"
         torch.save(
             {
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
+                "fold": self.fold,
+                "best_epoch": self.best_epoch,
+                "best_score": self.best_score,
+                "model_state_dict": self.best_model_state,
                 "optimizer_state_dict": self.optimizer.state_dict(),
-                "best_icbhi_score": self.best_icbhi_score,
                 "config": self.cfg,
             },
             path,
         )
         print(f"  Checkpoint saved → {path}")
-
-    def _current_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
