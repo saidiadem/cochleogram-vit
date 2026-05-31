@@ -6,6 +6,12 @@ torchvision>=0.16.0
 # Vision Transformer
 vit-pytorch>=1.7.0
 
+# KAN (Kolmogorov-Arnold Network) — used in CochleogramViTKAN variant
+efficient-kan @ git+https://github.com/Blealtan/efficient-kan.git
+
+# Pretrained backbones (transfer learning) — used in CochleogramViTPretrained
+timm>=1.0.0
+
 # Audio / Signal Processing
 librosa>=0.10.0
 soundfile>=0.12.1
