@@ -1,50 +1,75 @@
+# src/cochleogram_vit/training/metrics.py
 """
 Evaluation metrics for ICBHI classification.
 
-The ICBHI challenge uses a specific scoring metric:
-    Score = (Sensitivity + Specificity) / 2
-where both are computed in a 4-class multi-class setting.
+Metric definitions follow the paper exactly:
+  TP = adventitious correctly classified (exact subtype match)
+  TN = normal correctly classified
+  FP = normal incorrectly classified as adventitious
+  FN = adventitious incorrectly classified as normal  (paper definition)
+  FN_wrong_type = adventitious predicted as wrong adventitious subtype
+                  (stored for analysis, not used in score)
 
-We also report standard sklearn metrics for completeness.
+  Sensitivity = TP / (TP + FN)
+  Specificity = TN / (TN + FP)
+  Precision   = TP / (TP + FP)
+  Accuracy    = (TP + TN) / total_samples
+  Score       = (Sensitivity + Specificity) / 2
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
-from sklearn.metrics import classification_report, confusion_matrix
 
 
-def icbhi_score(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 4) -> float:
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict:
     """
-    Compute the official ICBHI challenge score.
+    Compute all metrics for one fold or aggregated results.
 
-    Score = mean over classes of (TP_k / (TP_k + FN_k + FP_k + TN_k ...))
-    Simplified as average of per-class sensitivity and specificity.
+    Args:
+        y_true: Ground truth labels (0=normal, 1=crackles, 2=wheezes, 3=both)
+        y_pred: Predicted labels
 
-    Returns a scalar in [0, 1].
+    Returns:
+        Dict with sensitivity, specificity, precision, accuracy, score,
+        TP, FN, FN_wrong_type, TN, FP.
     """
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
-    per_class_sensitivity = []
-    per_class_specificity = []
+    TP = int(np.sum((y_true != 0) & (y_pred == y_true)))
+    FN = int(np.sum((y_true != 0) & (y_pred == 0)))                               # paper def: adventitious → normal
+    FN_wrong_type = int(np.sum((y_true != 0) & (y_pred != 0) & (y_pred != y_true))) # subtype confusion, stored only
+    TN = int(np.sum((y_true == 0) & (y_pred == 0)))
+    FP = int(np.sum((y_true == 0) & (y_pred != 0)))
 
-    for k in range(n_classes):
-        tp = cm[k, k]
-        fn = cm[k, :].sum() - tp
-        fp = cm[:, k].sum() - tp
-        tn = cm.sum() - tp - fn - fp
+    assert FN + FN_wrong_type + TP == int(np.sum(y_true != 0)), \
+        "Adventitious decomposition mismatch"
 
-        sensitivity = tp / (tp + fn + 1e-8)
-        specificity = tn / (tn + fp + 1e-8)
-        per_class_sensitivity.append(sensitivity)
-        per_class_specificity.append(specificity)
+    total = len(y_true)
+    sensitivity = TP / (TP + FN + 1e-8)
+    specificity = TN / (TN + FP + 1e-8)
+    precision   = TP / (TP + FP + 1e-8)
+    accuracy    = (TP + TN) / total
+    score       = (sensitivity + specificity) / 2.0
 
-    score = (np.mean(per_class_sensitivity) + np.mean(per_class_specificity)) / 2.0
-    return float(score)
+    return {
+        "sensitivity":   sensitivity,
+        "specificity":   specificity,
+        "precision":     precision,
+        "accuracy":      accuracy,
+        "score":         score,
+        "TP":            TP,
+        "FN":            FN,
+        "FN_wrong_type": FN_wrong_type,
+        "TN":            TN,
+        "FP":            FP,
+    }
 
 
 class MetricTracker:
-    """Accumulates predictions over an epoch and computes all metrics at once."""
+    """Accumulates predictions over an epoch for TensorBoard logging."""
 
     def __init__(self):
         self.reset()
@@ -62,22 +87,10 @@ class MetricTracker:
         self._loss_sum += loss
         self._n_batches += 1
 
-    def compute(self) -> dict[str, float]:
-        y_pred = np.array(self._preds)
-        y_true = np.array(self._targets)
-
-        acc = (y_pred == y_true).mean()
-        score = icbhi_score(y_true, y_pred)
-        avg_loss = self._loss_sum / max(self._n_batches, 1)
-
-        return {
-            "loss": avg_loss,
-            "accuracy": float(acc),
-            "icbhi_score": score,
-        }
-
-    def classification_report(self) -> str:
-        target_names = ["normal", "crackle", "wheeze", "both"]
-        return classification_report(
-            self._targets, self._preds, target_names=target_names, zero_division=0
+    def compute(self) -> dict:
+        metrics = compute_metrics(
+            np.array(self._targets),
+            np.array(self._preds),
         )
+        metrics["loss"] = self._loss_sum / max(self._n_batches, 1)
+        return metrics
